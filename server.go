@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 type Server struct {
@@ -43,23 +45,65 @@ func (server *Server) ListenMessage() {
 
 // 广播消息实现
 func (server *Server) Broadcast(user *User, msg string) {
-	sendMsg := "[" + user.Addr + "]" + user.Name + msg
+	sendMsg := "[" + user.Addr + "]" + user.Name + ":" + msg
 
 	server.Message <- sendMsg
 }
 
 func (server *Server) Handler(conn net.Conn) {
+	user := NewUser(conn, server)
+
 	// 用户上线, 将用户加入onlineMap中
-	server.mapLock.Lock()
-	user := NewUser(conn)
-	server.OnlineMap[user.Name] = user
-	server.mapLock.Unlock()
+	user.Online()
 
-	// 广播当前用户上线消息
-	server.Broadcast(user, "已上线")
+	// 监听用户是否活跃的channel
+	isLive := make(chan bool)
 
-	// 阻塞
-	select {}
+	// 接受客户端发送的消息
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buf)
+			if n == 0 {
+				user.Offline()
+				return
+			}
+
+			// 存在非法操作
+			if err != nil && err != io.EOF {
+				fmt.Println("conn.Read error:", err)
+				return
+			}
+
+			// 提取用户消息(去除'\n')
+			msg := string(buf[:n-1])
+
+			// 用户在线则发送消息
+			user.MsgProcess(msg)
+
+			// 用户活跃, 重置定时器
+			isLive <- true
+		}
+	}()
+
+	// 设置一个定时器, 超时用户下线
+	for {
+		select {
+		case <-isLive:
+			//当前用户活跃, 重置定时器: 不做处理, 激活time.After(time.Second * 10)
+		case <-time.After(time.Second * 100):
+			// 超时删除用户
+			user.SendMsg("你已超时, 被踢出")
+
+			// 销毁用户资源
+			close(user.Channel)
+
+			// 关闭连接
+			conn.Close()
+
+			return
+		}
+	}
 }
 
 // 启动服务器的接口
